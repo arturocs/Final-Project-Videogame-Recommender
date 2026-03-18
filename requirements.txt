@@ -16,5 +16,10 @@ sqlalchemy>=2.0.38
 streamlit==1.54.0
 sympy>=1.10.1
 xgboost
-fastparquet
-
+deep-translator==1.11.4
+langdetect==1.0.9
+sentence_transformers==5.2.3
+faiss-cpu==1.13.2
+torch==2.3.1+cu121
+torchvision==0.18.1+cu121
+torchaudio==2.3.2+cu121
