@@ -55,10 +55,10 @@ df = pd.read_parquet(file_path)
 df = df.reset_index(drop=True)
 df["faiss_id"] = np.arange(len(df))
 
-filtered_df = df.copy()
-
 df["developers_clean"] = df["developers"].apply(lambda dev_list: [clean_publisher_developer(dev) for dev in dev_list])
 df["publishers_clean"] = df["publishers"].apply(lambda publishers_list: [clean_publisher_developer(publisher) for publisher in publishers_list])
+
+filtered_df = df.copy()
 
 choosen_genres = []
 choosen_categories = []
@@ -85,12 +85,12 @@ if show_dp:
     choosen_publisher = st.selectbox("Elige tu Distribuidor", sorted_publisher)
 
 
-user_description = st.text_area("Para mejorar la recomendación escribe una descripción (máx 200 caracteres): ")
+user_description = st.text_area("Para mejorar la recomendación escribe una descripción (máx 300 caracteres): ")
 text=""
 
-if len(user_description) > 200:
-    st.warning(f"Has escrito {len(user_description)} caracteres. El máximo es 200.")
-    text = user_description[:200]
+if len(user_description) > 300:
+    st.warning(f"Has escrito {len(user_description)} caracteres. El máximo es 300 y solo leera hasta el último.")
+    text = user_description[:300]
 
 
 bert_var = 0
@@ -151,17 +151,24 @@ column_rename = {
 
 if bert_var==1:
     
-    df["estimated_owners_max"] = df['estimated_owners'].str.split(' - ').str[1].astype(int)
-    df_ordered_by_owners = df.sort_values(by='estimated_owners_max', ascending=False)
-    df_display = df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
-    st.dataframe(df_display)
+    if filtered_df.empty:
+            st.write("No hay resultados para esos filtros")
+    else:
+        df["estimated_owners_max"] = df['estimated_owners'].str.split(' - ').str[1].astype(int)
+        df_ordered_by_owners = df.sort_values(by='estimated_owners_max', ascending=False)
+        df_display = df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
+        st.dataframe(df_display)
 
 elif bert_var==2:
 
-    filtered_df["estimated_owners_max"] = filtered_df['estimated_owners'].str.split(' - ').str[1].astype(int)
-    filtered_df_ordered_by_owners = filtered_df.sort_values(by='estimated_owners_max', ascending=False)
-    df_display = filtered_df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
-    st.dataframe(df_display)
+
+    if filtered_df.empty:
+            st.write("No hay resultados para esos filtros")
+    else:
+        filtered_df["estimated_owners_max"] = filtered_df['estimated_owners'].str.split(' - ').str[1].astype(int)
+        filtered_df_ordered_by_owners = filtered_df.sort_values(by='estimated_owners_max', ascending=False)
+        df_display = filtered_df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
+        st.dataframe(df_display)
 
 else:
 
