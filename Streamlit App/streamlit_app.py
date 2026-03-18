@@ -21,7 +21,7 @@ import sys
 import os
 import importlib.util
 
-path = os.path.abspath(os.path.join(os.getcwd(), "Recommedation System", "user_api.py"))
+path = os.path.abspath(os.path.join(os.getcwd(), "Recommendation System", "user_api.py"))
 spec = importlib.util.spec_from_file_location("user_api", path)
 user_api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(user_api)
