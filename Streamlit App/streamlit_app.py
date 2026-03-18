@@ -8,6 +8,23 @@ import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from deep_translator import GoogleTranslator
+from langdetect import detect
+from sentence_transformers import SentenceTransformer
+import torch
+from pathlib import Path
+import faiss
+
+import numpy as np
+
+import sys
+import os
+import importlib.util
+
+path = os.path.abspath(r"..\Recommedation System\user_api.py")
+spec = importlib.util.spec_from_file_location("user_api", path)
+user_api = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(user_api)
 
 # -------------------------
 # Config
@@ -167,6 +184,31 @@ def fetch_user_recommendations_mock(steam_id: str, top_k: int = 10) -> pd.DataFr
         {"name": "Baldur's Gate 3", "genres": "RPG|Strategy", "reason": "Strong overlap with favorite genres"},
     ]
     return pd.DataFrame(data).head(top_k)
+
+def translate_to_english(text):
+    try:
+        detected_lang = detect(text)
+        if detected_lang != 'en':
+            translated_text = GoogleTranslator(source='auto', target='en').translate(text)
+            return translated_text
+        return text
+    except Exception as e:
+        print(f"Error al detectar idioma: {e}")
+        return text
+
+# Clean developers and publishers
+def clean_publisher_developer(dev):
+    dev = dev.lower()      
+    dev = dev.strip()       
+    dev = re.sub(r'[.,]', '', dev)     
+    dev = re.sub(r'\s+', ' ', dev)
+    
+    remove_words = ["inc", "ltd", "llc", "corp", "corporation", "company", "co"]
+    
+    words = dev.split()
+    words = [w for w in words if w not in remove_words]
+    
+    return " ".join(words)
 
 
 # -------------------------
@@ -434,203 +476,177 @@ with tab1:
 # TAB 2: Prompt Bot
 # =========================================================
 with tab2:
+
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
     st.subheader("🔮 Prompt Bot (recomendación por texto/mood)")
     st.caption("Primero aplicamos un filtro compuesto, luego usamos TF-IDF para recomendar dentro del subset filtrado.")
 
-    prompt = st.text_area(
-        "Tu prompt",
-        placeholder="Ej: Estoy cansada y quiero algo cozy, relajante, sin terror, que pueda jugar sola.",
-        height=90,
-        key="prompt_text",
-    )
+    # Store model in cache
+    @st.cache_resource
+    def load_model():
+        return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        top_k_prompt = st.slider("Top K", 3, 30, 10, key="topk_prompt")
-    with c2:
-        sample_n_prompt = st.slider("Tamaño muestra", 2000, 50000, 15000, step=1000, key="sample_prompt")
-    with c3:
-        max_feats_prompt = st.slider("Max features TF-IDF", 5000, 50000, 20000, step=5000, key="max_feats_prompt")
 
-    use_extra = st.checkbox(
-        "Usar géneros/tags además de descripción",
-        value=True,
-        key="use_extra_prompt"
-    )
+    file_path = PROJECT_ROOT / "data" / "processed" / "df_clean.parquet"
+    faiss_index_path = PROJECT_ROOT / "data" / "processed" / "games_embeddings_faiss_IP.index"
 
-    text_col = pick_text_col(work)
-    if not text_col:
-        st.warning("No hay columna de texto (short/detailed_description). El prompt bot necesita texto.")
+    df = pd.read_parquet(file_path)
+
+    df = df.reset_index(drop=True)
+    df["faiss_id"] = np.arange(len(df))
+    
+    
+    df["developers_clean"] = df["developers"].apply(lambda dev_list: [clean_publisher_developer(dev) for dev in dev_list])
+    df["publishers_clean"] = df["publishers"].apply(lambda publishers_list: [clean_publisher_developer(publisher) for publisher in publishers_list])
+
+    filtered_df = df.copy()
+
+
+    choosen_genres = []
+    choosen_categories = []
+    choosen_tags = []
+
+    choosen_developer = []
+    choosen_publisher = []
+
+    sorted_genres = sorted(set(g for sublist in df["genres"] for g in sublist))
+    sorted_categories = sorted(set(g for sublist in df["categories"] for g in sublist))
+    sorted_tags = sorted(set(g for sublist in df["tags"] for g in sublist))
+
+    choosen_genres = st.multiselect("Elige tus Género deseados", sorted_genres)
+    choosen_categories = st.multiselect("Elige tus Categorias deseadas", sorted_categories)
+    choosen_tags = st.multiselect("Elige tus Etiquetas deseadas ", sorted_tags)
+
+    show_dp = st.checkbox("Clicka el cuadrado para mostrar Desarrollador/Distribuidor", value=False)
+
+    if show_dp:
+        sorted_developer = sorted(set(g for sublist in df["developers_clean"] for g in sublist))
+        sorted_publisher = sorted(set(g for sublist in df["publishers_clean"] for g in sublist))
+
+        choosen_developer = st.selectbox("Elige tu Desarrollador", sorted_developer)
+        choosen_publisher = st.selectbox("Elige tu Distribuidor", sorted_publisher)
+
+
+    user_description = st.text_area("Para mejorar la recomendación escribe una descripción (máx 300 caracteres): ")
+    text=""
+
+    if len(user_description) > 300:
+        st.warning(f"Has escrito {len(user_description)} caracteres. El máximo es 300 y solo leera hasta el último.")
+        text = user_description[:300]
+
+
+
+    bert_var = 0
+
+    if not choosen_genres and not choosen_categories and not choosen_tags and not choosen_developer and not choosen_publisher and not user_description:
+        bert_var = 1
+
+    elif not user_description:
+        bert_var = 2
+
+        if choosen_genres:
+            filtered_df = filtered_df[filtered_df["genres"].apply(lambda x: any(g in x for g in choosen_genres))]
+
+        if choosen_categories:
+            filtered_df = filtered_df[filtered_df["categories"].apply(lambda x: any(g in x for g in choosen_categories))]
+
+        if choosen_tags:
+            filtered_df = filtered_df[filtered_df["tags"].apply(lambda x: any(g in x for g in choosen_tags))]
+
+        if choosen_developer:
+            filtered_df = filtered_df[filtered_df["developers_clean"].apply(lambda x: choosen_developer in [g for g in x])]
+
+        if choosen_publisher:
+            filtered_df = filtered_df[filtered_df["publishers_clean"].apply(lambda x: choosen_publisher in [g for g in x])]
+
     else:
-        advanced_enabled = st.toggle("Activar filtro avanzado", value=False, key="advanced_enabled")
+        
+        if choosen_genres:
+            filtered_df = filtered_df[filtered_df["genres"].apply(lambda x: any(g in x for g in choosen_genres))]
 
-        # Detectar columnas reales del dataset
-        genre_col = first_existing_col(work, ["genres", "genre"])
-        category_col = first_existing_col(work, ["categories", "category"])
-        tag_col = first_existing_col(work, ["tags", "tag"])
-        platform_col = first_existing_col(work, ["platforms", "platform"])
-        developer_col = first_existing_col(work, ["developers", "developer"])
-        publisher_col = first_existing_col(work, ["publishers", "publisher"])
+        if choosen_categories:
+            filtered_df = filtered_df[filtered_df["categories"].apply(lambda x: any(g in x for g in choosen_categories))]
 
-        with st.expander("🧩 Filtro compuesto (avanzado)", expanded=advanced_enabled):
+        if choosen_tags:
+            filtered_df = filtered_df[filtered_df["tags"].apply(lambda x: any(g in x for g in choosen_tags))]
 
-            selected_genres = []
-            selected_categories = []
-            selected_tags = []
-            selected_platforms = []
-            selected_developers = []
-            selected_publishers = []
+        if choosen_developer:
+            filtered_df = filtered_df[filtered_df["developers_clean"].apply(lambda x: choosen_developer in [g for g in x])]
 
-            if genre_col:
-                genre_options = build_options_from_col(work, genre_col, top_n=150)
-                selected_genres = st.multiselect(
-                    "🎭 Géneros",
-                    genre_options,
-                    default=[],
-                    key="selected_genres",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de géneros en el dataset.")
+        if choosen_publisher:
+            filtered_df = filtered_df[filtered_df["publishers_clean"].apply(lambda x: choosen_publisher in [g for g in x])]
 
-            if category_col:
-                cat_options = build_options_from_col(work, category_col, top_n=150)
-                selected_categories = st.multiselect(
-                    "🧩 Categorías",
-                    cat_options,
-                    default=[],
-                    key="selected_categories",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de categorías en el dataset.")
 
-            if tag_col:
-                tag_options = build_options_from_col(work, tag_col, top_n=150)
-                selected_tags = st.multiselect(
-                    "🏷️ Tags",
-                    tag_options,
-                    default=[],
-                    key="selected_tags",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de tags en el dataset.")
+    k = st.slider('Cuantos juegos quieres de vuelta?', value = 5)
 
-            if platform_col:
-                platform_options = build_options_from_col(work, platform_col, top_n=100)
-                selected_platforms = st.multiselect(
-                    "🕹️ Plataformas",
-                    platform_options,
-                    default=[],
-                    key="selected_platforms",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de plataformas en el dataset.")
+    column_rename = {
+        'name': 'Juego',
+        'about_the_game': 'Descripción',
+        'categories': 'Categorías',
+        'genres': 'Géneros',
+        'tags': 'Tags',
+        'developers_clean': 'Desarrolladores',
+        'publishers_clean': 'Distribuidores',
+        'windows': 'Windows',
+        'linux': 'Linux',
+        'mac': 'Mac'
+    }
 
-            if developer_col:
-                developer_options = build_options_from_col(work, developer_col, top_n=100)
-                selected_developers = st.multiselect(
-                    "👨‍💻 Developers",
-                    developer_options,
-                    default=[],
-                    key="selected_developers",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de developers en el dataset.")
+    if bert_var==1:
+        
+        if filtered_df.empty:
+            st.write("No hay resultados para esos filtros")
+        else:
+            df["estimated_owners_max"] = df['estimated_owners'].str.split(' - ').str[1].astype(int)
+            df_ordered_by_owners = df.sort_values(by='estimated_owners_max', ascending=False)
+            df_display = df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
+            st.dataframe(df_display)
 
-            if publisher_col:
-                publisher_options = build_options_from_col(work, publisher_col, top_n=100)
-                selected_publishers = st.multiselect(
-                    "🏢 Publishers",
-                    publisher_options,
-                    default=[],
-                    key="selected_publishers",
-                    disabled=not advanced_enabled
-                )
-            else:
-                st.caption("No hay columna de publishers en el dataset.")
+    elif bert_var==2:
 
-            include_kw = st.text_input(
-                "Incluir palabras (coma)",
-                "",
-                key="include_kw",
-                disabled=not advanced_enabled
-            )
+        if filtered_df.empty:
+            st.write("No hay resultados para esos filtros")
+        else:
+            filtered_df["estimated_owners_max"] = filtered_df['estimated_owners'].str.split(' - ').str[1].astype(int)
+            filtered_df_ordered_by_owners = filtered_df.sort_values(by='estimated_owners_max', ascending=False)
+            df_display = filtered_df_ordered_by_owners[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True)
+            st.dataframe(df_display)
 
-            exclude_kw = st.text_input(
-                "Excluir palabras (coma)",
-                "",
-                key="exclude_kw",
-                disabled=not advanced_enabled
-            )
+    else:
 
-        filtered = apply_composite_filter(
-            df_in=work,
-            genre_col=genre_col,
-            category_col=category_col,
-            tag_col=tag_col,
-            platform_col=platform_col,
-            developer_col=developer_col,
-            publisher_col=publisher_col,
-            selected_genres=selected_genres,
-            selected_categories=selected_categories,
-            selected_tags=selected_tags,
-            selected_platforms=selected_platforms,
-            selected_developers=selected_developers,
-            selected_publishers=selected_publishers,
-            include_kw=include_kw,
-            exclude_kw=exclude_kw,
-            text_col_for_kw=text_col
-        )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        st.write(f"Después del filtro compuesto: **{len(filtered):,}** juegos")
+        query_translated = translate_to_english(user_description)
+        model = load_model()
 
-        if st.button("Recomiéndame por prompt", key="btn_prompt"):
-            if not prompt.strip():
-                st.warning("Escribe un prompt primero.")
-            elif len(filtered) < 5:
-                st.warning("Tras filtros quedan muy pocos juegos. Afloja filtros o aumenta dataset.")
-            else:
-                base2 = filtered.copy()
-                if len(base2) > sample_n_prompt:
-                    base2 = base2.sample(n=sample_n_prompt, random_state=42)
+        query_embedding = model.encode([query_translated], device=device, normalize_embeddings=True)
+        query_embedding_np = np.array(query_embedding, dtype=np.float32)
 
-                extra_cols = []
-                if use_extra:
-                    for c in [genre_col, category_col, tag_col, platform_col, developer_col, publisher_col]:
-                        if c is not None and c in base2.columns:
-                            extra_cols.append(c)
+        index = faiss.read_index(str(faiss_index_path))
 
-                base2[text_col] = base2[text_col].fillna("").astype(str)
-                for c in extra_cols:
-                    base2[c] = base2[c].fillna("").astype(str)
+        distances, indices = index.search(query_embedding_np, 20000)
 
-                def make_doc(r):
-                    parts = [safe_str(r.get(text_col, ""))]
-                    for c in extra_cols:
-                        parts.append(safe_str(r.get(c, "")))
-                    return " ".join(parts)
+        filtered_indices = set(filtered_df["faiss_id"])
 
-                docs = tuple(base2.apply(make_doc, axis=1).tolist())
-                vec2, X2 = build_tfidf_matrix(docs, max_features=max_feats_prompt)
+        if indices.size == 0:
+            print("No se encontraron resultados.")
+        else:
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx in filtered_indices:
+                    sim_score = distances[0][i]
+                    results_df = df.iloc[idx].to_dict()
+                    results_df['similarity'] = sim_score
+                    results.append(results_df)
 
-                qv = vec2.transform([prompt])
-                sims2 = cosine_similarity(qv, X2).flatten()
-                order2 = sims2.argsort()[::-1][:top_k_prompt]
+            results_df = pd.DataFrame(results)
 
-                recs_cols2 = [
-                    c for c in [
-                        "app_id", "name", "price", "release_date",
-                        genre_col, category_col, tag_col
-                    ]
-                    if c is not None and c in base2.columns
-                ]
-                out = base2.iloc[order2][recs_cols2].copy()
-                out["similarity"] = sims2[order2]
-                st.dataframe(out, use_container_width=True)
+        if results_df.empty:
+            st.write("No hay resultados para esos filtros")
+        else:
+            st.write(results_df[['name', 'about_the_game', 'categories', 'genres', 'tags', 'developers_clean', 'publishers_clean', 'windows', 'linux', 'mac']].head(k).rename(columns=column_rename).reset_index(drop=True))
+
 
 
 # =========================================================
@@ -716,81 +732,200 @@ with tab4:
     st.caption("Introduce un Steam ID para generar recomendaciones basadas en el perfil del usuario." \
     " Debe ser público.")
 
-    steam_id = st.text_input(
+    url_user = st.text_input(
         "Steam ID del usuario, alias o url de perfil",
-        placeholder="Ej: 7656119XXXXXXXXXX",
-        key="steam_user_id"
+        placeholder="Ej: 7656119XXXXXXXXXX"
     )
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        load_user_btn = st.button("Buscar usuario", key="load_user_btn")
-    with c2:
-        top_k_user = st.slider("Top recomendaciones", 3, 20, 10, key="top_k_user")
+    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import ast
 
-    # Sitio donde guardamos el perfil cargado
-    if "loaded_user_profile" not in st.session_state:
-        st.session_state["loaded_user_profile"] = None
+    COLUMNS = ["genres", "tags", "categories"]
 
-    if load_user_btn:
-        if not steam_id.strip():
-            st.warning("Introduce un Steam ID.")
-        else:
-            with st.spinner("Buscando usuario..."):
-                # TODO: sustituir por API real
-                profile = fetch_user_profile_mock(steam_id)
+    def clean_value(value):
+        if value is None:
+            return ""
 
-            if not profile.get("ok", False):
-                st.error("No se pudo cargar el usuario. Puede que el perfil sea privado o el ID no sea válido.")
-                st.session_state["loaded_user_profile"] = None
-            else:
-                st.session_state["loaded_user_profile"] = profile
-                st.success("Usuario cargado correctamente ✅")
+        # NaN
+        if isinstance(value, float) and np.isnan(value):
+            return ""
 
-    profile = st.session_state.get("loaded_user_profile")
+        # ndarray
+        if isinstance(value, np.ndarray):
+            return " ".join(str(i).strip() for i in value if str(i).strip())
 
-    if profile:
-        st.markdown("### 👤 Perfil del usuario")
-        info_col1, info_col2 = st.columns(2)
+        # list
+        if isinstance(value, list):
+            return " ".join(str(i).strip() for i in value if str(i).strip())
 
-        with info_col1:
-            st.write(f"*Usuario:* {profile.get('user_name', 'N/A')}")
-            st.write(f"*Steam ID:* {profile.get('steam_id', 'N/A')}")
-            st.write(f"*Perfil público:* {'Sí' if profile.get('is_public') else 'No'}")
+        # dict
+        if isinstance(value, dict):
+            return " ".join(str(k).strip() for k in value.keys() if str(k).strip())
 
-        with info_col2:
-            st.write("*Géneros favoritos:*")
-            fav_genres = profile.get("favorite_genres", [])
-            if fav_genres:
-                st.write(", ".join(fav_genres))
-            else:
-                st.write("No disponible")
+        # string
+        if isinstance(value, str):
+            text = value.strip()
+            if text == "" or text == "[]":
+                return ""
 
-            st.write("*Tags favoritas:*")
-            fav_tags = profile.get("favorite_tags", [])
-            if fav_tags:
-                st.write(", ".join(fav_tags))
-            else:
-                st.write("No disponible")
+            # 🔥 If it looks like a list or dict, try parsing
+            if text.startswith("[") or text.startswith("{"):
+                try:
+                    parsed_value = ast.literal_eval(text)
+                    if isinstance(parsed_value, dict):
+                        return " ".join(str(k).strip() for k in parsed_value.keys() if str(k).strip())
+                    if isinstance(parsed_value, list):
+                        return " ".join(str(i).strip() for i in parsed_value if str(i).strip())
+                except:
+                    pass  # if parsing fails, continue
 
-        st.markdown("### 🎮 Juegos más jugados")
-        top_games = profile.get("top_games", [])
-        if top_games:
-            st.dataframe(pd.DataFrame(top_games), use_container_width=True)
-        else:
-            st.info("No hay juegos para mostrar.")
+            return text
 
-        st.divider()
+        return ""
 
-        if st.button("Recomiéndame en base a este usuario", key="recommend_user_btn"):
-            with st.spinner("Generando recomendaciones..."):
-                # TODO: sustituir por API real
-                recs_user = fetch_user_recommendations_mock(profile["steam_id"], top_k=top_k_user)
 
-            st.markdown("### ✨ Recomendaciones para este usuario")
-            if recs_user is not None and len(recs_user) > 0:
-                st.dataframe(recs_user, use_container_width=True)
-            else:
-                st.warning("No se encontraron recomendaciones.")
-    else:
-        st.info("Carga un usuario para ver su perfil y generar recomendaciones.")
+    def remove_duplicates(text):
+        words = text.split()
+        return " ".join(dict.fromkeys(words))  # keeps order and removes duplicates
+
+    def prepare_text(df):
+        df = df.copy()
+        clean_columns = []
+
+        for col in COLUMNS:
+            if col in df.columns:
+                series = (
+                    df[col]
+                    .map(clean_value)   # faster than apply
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                )
+                clean_columns.append(series)
+
+        if not clean_columns:
+            df["combined_features"] = ""
+            return df
+
+        # vectorized concatenation
+        combined = clean_columns[0]
+        for series in clean_columns[1:]:
+            combined = combined.str.cat(series, sep=" ")
+
+        # clean extra spaces
+        df["combined_features"] = (
+            combined
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+            .map(remove_duplicates)
+        )
+
+        return df
+
+
+    def build_user_vector(df, user_games, X):
+
+        if X is None:
+            return None
+
+        # Asegurarse de que app_id sea numérico
+        df["app_id"] = pd.to_numeric(df["app_id"], errors="coerce")
+
+        user_appids = user_games["appid"].astype(int).tolist()
+        indices = df[df["app_id"].isin(user_appids)].index
+
+        if len(indices) == 0:
+            return None
+
+        # Promedio de los vectores de los juegos del usuario
+        user_vector = X[indices].mean(axis=0)
+
+        # 🔥 Convertimos a array normal
+        user_vector = np.asarray(user_vector)
+
+        return user_vector
+
+    def recommend(df, X, user_vector, user_games, top_n=10):
+
+        if X is None or user_vector is None:
+            print("❌ X o user_vector son None")
+            return pd.DataFrame()
+
+        # Asegurar que app_id sea numérico
+        df["app_id"] = pd.to_numeric(df["app_id"], errors="coerce")
+
+        # Calcular similitud
+        similarities = cosine_similarity(user_vector, X)
+        scores = similarities.flatten()
+
+        df = df.copy()
+        df["similarity"] = scores
+
+        # 🔹 Obtener juegos del usuario
+        user_appids = set(user_games["appid"].astype(int))
+
+        # 🔹 No recomendar juegos que el usuario ya posee
+        recommendations = df[~df["app_id"].isin(user_appids)]
+
+        # Ordenar por similitud
+        recommendations = recommendations.sort_values("similarity", ascending=False)
+
+        return recommendations.head(top_n)
+
+
+
+    import pandas as pd
+
+    # 1️⃣ Cargar dataset
+    print("🔄 Cargando dataset...")
+
+    # 2️⃣ Preparar texto y matriz TF-IDF
+    print("🧠 Preparando features...")
+    df = prepare_text(df)
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    vectorizer = TfidfVectorizer(stop_words="english")
+    X = vectorizer.fit_transform(df["combined_features"])
+
+    # 3️⃣ Pedir URL de Steam
+    steamid = user_api.extract_steamid(url_user)
+
+    if not steamid:
+        print("❌ No se pudo obtener el SteamID.")
+        exit()
+
+    print("✅ SteamID detectado:", steamid)
+
+    # 4️⃣ Obtener juegos del usuario
+    juegos_usuario = user_api.get_user_games(steamid)
+
+    if juegos_usuario.empty:
+        print("⚠️ Perfil privado o sin juegos.")
+        exit()
+
+    print(f"🎮 Juegos encontrados: {len(juegos_usuario)}")
+
+    # 5️⃣ Construir vector del usuario
+    user_vector = build_user_vector(df, juegos_usuario, X)
+
+    if user_vector is None:
+        print("⚠️ No se pudieron mapear los juegos al dataset.")
+        exit()
+    else: 
+        print("Conseguido")
+
+    # 6️⃣ Generar recomendaciones
+    recomendaciones = recommend(df, X, user_vector, juegos_usuario, top_n=10)
+
+    st.write("\n🎯 RECOMENDACIONES PERSONALIZADAS:\n")
+
+    for i, row in recomendaciones.iterrows():
+        st.write(f"🎮 {row['name']}")
+        st.write(f"   Géneros: {row['genres']}")
+        st.write(f"   Tags: {row['tags']}")
+        st.write(f"   Categorias: {row['categories']}")
+
+
+        st.write("-" * 30)
+
